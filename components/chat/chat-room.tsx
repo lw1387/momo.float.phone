@@ -1,7 +1,7 @@
 "use client";
 
 import { forwardRef, Fragment, memo, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { ChatSession, ChatMessage, CHAT_APP_SETTINGS_UPDATED_EVENT, CHAT_INITIAL_VISIBLE_MESSAGE_COUNT, CHAT_LOAD_MORE_MESSAGE_COUNT, CHAT_REQUEST_REPLY_EVENT, loadChatAppSettings, loadChatMessages, loadChatContacts, loadChatSessions, saveChatSessions, pushChatMessage, updateChatMessage, deleteChatMessage, deleteChatMessagesFrom, deleteChatMessagesByIds, retractChatMessage, editChatMessage, updateMessageMediaData, replaceResponseBatchWithParts, replaceGroupResponseRound, isReadingDiscussMessage, isSystemInstructionMessage, createResponseBatchId, createResponseRoundId, getLatestStateValues, getLatestCharacterStateValues, compareChatMessages, isSessionStreamingEnabled, resolveChatBackgroundImage, resolveChatUserAvatar } from "@/lib/chat-storage";
+import { ChatSession, ChatMessage, CHAT_APP_SETTINGS_UPDATED_EVENT, CHAT_INITIAL_VISIBLE_MESSAGE_COUNT, CHAT_LOAD_MORE_MESSAGE_COUNT, CHAT_REQUEST_REPLY_EVENT, loadChatAppSettings, loadChatMessages, loadChatContacts, loadChatSessions, saveChatSessions, pushChatMessage, updateChatMessage, deleteChatMessage, deleteChatMessagesFrom, deleteChatMessagesByIds, retractChatMessage, editChatMessage, updateMessageMediaData, replaceResponseBatchWithParts, replaceGroupResponseRound, isReadingDiscussMessage, isSystemInstructionMessage, getSystemInstructionDisplayContent, createResponseBatchId, createResponseRoundId, getLatestStateValues, getLatestCharacterStateValues, compareChatMessages, isSessionStreamingEnabled, resolveChatBackgroundImage, resolveChatCharacterAvatar, resolveChatUserAvatar } from "@/lib/chat-storage";
 import { cleanStreamText, splitStreamPreviewSegments, stripLiteralTexts, stripXmlTagBlocks } from "@/lib/stream-preview";
 import type { StateValue } from "@/lib/chat-storage";
 import { parseStateValues, mergeStateValues } from "@/lib/state-value-parser";
@@ -43,9 +43,10 @@ import { TransferTargetModal } from "./transfer-target-modal";
 import { GiftPickerModal } from "./gift-picker-modal";
 import { ConfirmDialog } from "@/components/ui/modal";
 import { deleteWeixinCloudMessagesFromCloud, emitWeixinSyncToast, syncAllWeixinBotRuntimesToCloud } from "@/lib/weixin-cloud-sync";
-import { loadBindingConfig, loadPresets, loadRegexes, resolveBinding, resolveUserIdentity, USER_IDENTITIES_UPDATED_EVENT } from "@/lib/settings-storage";
+import { loadBindingConfig, loadPresets, loadRegexes, resolveBinding, USER_IDENTITIES_UPDATED_EVENT } from "@/lib/settings-storage";
+import { resolveChatAccountUserIdentity } from "@/lib/chat-scope-storage";
 import { generateGroupChatCompletion, generateGroupOfflineChatCompletion, parseGroupChatResponse, buildEditableGroupRoundText } from "@/lib/group-chat-engine";
-import { appendChatOfflineTurn, deleteChatOfflineTurn, deleteChatOfflineTurnsFrom, extractThinkingTag, loadChatOfflineTurns, parseOfflineResponse, saveChatOfflineTurns, updateChatOfflineTurn, type ChatOfflineTurn } from "@/lib/chat-offline-storage";
+import { appendChatOfflineTurn, clearChatOfflineTurns, deleteChatOfflineTurn, deleteChatOfflineTurnsFrom, extractThinkingTag, loadChatOfflineTurns, parseOfflineResponse, preserveChatOfflineSummaries, saveChatOfflineTurns, updateChatOfflineTurn, type ChatOfflineTurn } from "@/lib/chat-offline-storage";
 import { applyDisplayRegex, applyEditRegex } from "@/lib/llm-prompt-assembler";
 import { scheduleFollowUp, cancelFollowUp, cancelBackgroundGeneration, isBackgroundReplyGenerating } from "@/lib/follow-up-service";
 import { useKeyboardDismissAutoSend } from "@/components/chat/use-keyboard-dismiss-auto-send";
@@ -88,6 +89,15 @@ import { extractTextToolDirectiveText } from "@/lib/text-tool-protocol";
 import { emitChatPluginEvent, getChatPluginHookBus, runChatPluginTransform } from "@/lib/chat-plugin-hooks";
 import { CHAT_PLUGIN_TOAST_EVENT, getChatPluginRuntime } from "@/lib/chat-plugin-runtime";
 import { ChatPluginSlot } from "@/components/chat/chat-plugin-slot";
+import {
+    createOrGetStorySession,
+    hydrateStoryStorage,
+    loadStorySessionsForOwner,
+    replaceStoryMessages,
+    saveStoryLaunchTarget,
+    updateStorySession,
+    type StoryMessage,
+} from "@/lib/story-storage";
 
 // ── Call system message detection ──────────────────────────
 // Call messages are stored with user/assistant role for correct prompt alternation,
@@ -313,6 +323,8 @@ type ManagedGenerationOptions = {
     history: ChatMessage[];
     errorPrefix?: string;
     onDecline?: () => void | Promise<void>;
+    /** 仅本次生成使用，不落为可见消息或聊天记录。 */
+    retryInstruction?: string;
 };
 
 const activeGenerationRuns = new Map<string, ActiveGenerationRun>();
@@ -459,6 +471,8 @@ type ChatRoomProps = {
     onBack: () => void;
     /** 会话在设置页被删除后回调：由外层卸载本聊天室并回到列表 */
     onDeleted?: () => void;
+    /** Embedded callers can observe user-sent rich messages without duplicating chat logic. */
+    onUserMessageSent?: (message: ChatMessage) => void;
 };
 
 type OfflineActionTarget = {
@@ -607,6 +621,7 @@ const ChatTextInputBar = memo(forwardRef<ChatTextInputHandle, {
     isGenerating: boolean;
     theaterMode: boolean;
     enterToSendEnabled: boolean;
+    storyEntryEnabled: boolean;
     quotingMessage: ChatMessage | null;
     showEmojiPanel: boolean;
     showStickerPanel: boolean;
@@ -638,6 +653,7 @@ const ChatTextInputBar = memo(forwardRef<ChatTextInputHandle, {
     isGenerating,
     theaterMode,
     enterToSendEnabled,
+    storyEntryEnabled,
     quotingMessage,
     showEmojiPanel,
     showStickerPanel,
@@ -820,8 +836,8 @@ const ChatTextInputBar = memo(forwardRef<ChatTextInputHandle, {
                 <button
                     onClick={onToggleOfflineMode}
                     className="ui-bare-btn text-[var(--c-text)] chat-offline-toggle"
-                    aria-label="线下模式"
-                    title="线下模式"
+                    aria-label={storyEntryEnabled ? "剧情入口" : "线下模式"}
+                    title={storyEntryEnabled ? "剧情入口" : "线下模式"}
                 >
                     <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                         <path d="M21 10c0 7-9 13-9 13S3 17 3 10a9 9 0 0 1 18 0Z" />
@@ -1077,7 +1093,7 @@ const OfflineTextInputBar = memo(forwardRef<OfflineTextInputHandle, {
     );
 }));
 
-export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
+export function ChatRoom({ session, onBack, onDeleted, onUserMessageSent }: ChatRoomProps) {
     const [liveCSS, setLiveCSS] = useState(session.customCSS || "");
     const [messages, setMessages] = useState<ChatMessage[]>([]);
     const [transientMessages, setTransientMessages] = useState<ChatMessage[]>([]);
@@ -1131,6 +1147,8 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
     const [callInitiatorName, setCallInitiatorName] = useState<string>("");
     const [userIdentity, setUserIdentity] = useState<UserIdentity | null>(null);
     const [enterToSendEnabled, setEnterToSendEnabled] = useState(() => loadChatAppSettings().enterToSendEnabled === true);
+    const [storyEntryEnabled, setStoryEntryEnabled] = useState(() => loadChatAppSettings().storyAsOfflineMode === true);
+    const [storyEntryMigrationOpen, setStoryEntryMigrationOpen] = useState(false);
     const [chatAppSettingsRevision, setChatAppSettingsRevision] = useState(0);
 
     // Rich media input modals
@@ -1148,7 +1166,9 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
 
     useEffect(() => {
         const syncEnterToSend = () => {
-            setEnterToSendEnabled(loadChatAppSettings().enterToSendEnabled === true);
+            const latest = loadChatAppSettings();
+            setEnterToSendEnabled(latest.enterToSendEnabled === true);
+            setStoryEntryEnabled(latest.storyAsOfflineMode === true);
             setChatAppSettingsRevision(value => value + 1);
         };
         window.addEventListener(CHAT_APP_SETTINGS_UPDATED_EVENT, syncEnterToSend);
@@ -1213,6 +1233,10 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
     const effectiveUserAvatar = useMemo(
         () => resolveChatUserAvatar(session, userIdentity?.avatarUrl),
         [session.userAvatarOverride, session.isGroup, userIdentity?.avatarUrl, chatAppSettingsRevision],
+    );
+    const effectiveCharacterAvatar = useMemo(
+        () => resolveChatCharacterAvatar(character),
+        [character?.avatar, character?.chatAvatar, character?.chatAvatarEnabled],
     );
     const globalChatCSS = useMemo(
         () => loadChatAppSettings().globalChatCustomCSS || "",
@@ -1303,6 +1327,8 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
     // Message Actions state
     const [activeMessageId, setActiveMessageId] = useState<string | null>(null);
     const [contextMenuAnchor, setContextMenuAnchor] = useState<ContextMenuAnchor | null>(null);
+    const [instructionRetryTargetId, setInstructionRetryTargetId] = useState<string | null>(null);
+    const [instructionRetryDraft, setInstructionRetryDraft] = useState("");
     const [isMultiSelectMode, setIsMultiSelectMode] = useState(false);
     const [selectedMessageIds, setSelectedMessageIds] = useState<Set<string>>(new Set());
     const [showConfirmMultiDelete, setShowConfirmMultiDelete] = useState(false);
@@ -1743,7 +1769,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
         const refreshAvatars = () => {
             const latestCharacter = loadCharacters().find(item => item.id === session.contactId) || null;
             setCharacter(latestCharacter);
-            setUserIdentity(resolveUserIdentity(session.contactId, "chat"));
+            setUserIdentity(resolveChatAccountUserIdentity(session.chatAccountId, session.contactId, "chat"));
         };
         window.addEventListener(CHARACTERS_UPDATED_EVENT, refreshAvatars);
         window.addEventListener(USER_IDENTITIES_UPDATED_EVENT, refreshAvatars);
@@ -1751,7 +1777,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
             window.removeEventListener(CHARACTERS_UPDATED_EVENT, refreshAvatars);
             window.removeEventListener(USER_IDENTITIES_UPDATED_EVENT, refreshAvatars);
         };
-    }, [session.contactId]);
+    }, [session.chatAccountId, session.contactId]);
 
     const availableShoppingGifts = useMemo(
         () => loadDeliveredShoppingGifts(),
@@ -1759,7 +1785,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
     );
 
     useEffect(() => {
-        setUserIdentity(resolveUserIdentity(session.contactId, "chat"));
+        setUserIdentity(resolveChatAccountUserIdentity(session.chatAccountId, session.contactId, "chat"));
         setTransientMessages([]);
         setOfflineMode(kvGet(CHAT_OFFLINE_MODE_PREFIX + session.id) === "1");
         setOfflineVisibleCount(OFFLINE_INITIAL_LOAD);
@@ -2854,7 +2880,30 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
             ? getLatestStateValues(session.id)
             : getLatestCharacterStateValues(session.contactId);
 
-        const { parts: rawParts, stateValues, freshStateValues, statusPanel, innerMonologue } = parseAIResponse(aiResponseText, previousState);
+        const { parts: rawParts, stateValues, freshStateValues, statusPanel, innerMonologue, characterRemarkForUser } = parseAIResponse(aiResponseText, previousState);
+        if (!session.isGroup && characterRemarkForUser) {
+            const normalizedRemark = characterRemarkForUser.replace(/[\r\n]/g, " ").trim().slice(0, 20);
+            if (normalizedRemark) {
+                const updatedAt = new Date().toISOString();
+                const sessions = loadChatSessions();
+                const index = sessions.findIndex(item => item.id === session.id);
+                if (index >= 0) {
+                    sessions[index] = {
+                        ...sessions[index],
+                        characterRemarkForUser: normalizedRemark,
+                        characterRemarkForUserUpdatedAt: updatedAt,
+                    };
+                    saveChatSessions(sessions);
+                }
+                Object.assign(session, {
+                    characterRemarkForUser: normalizedRemark,
+                    characterRemarkForUserUpdatedAt: updatedAt,
+                });
+                window.dispatchEvent(new CustomEvent("chat-character-remark-updated", {
+                    detail: { sessionId: session.id, remark: normalizedRemark, updatedAt },
+                }));
+            }
+        }
         const parts = stripInvalidStickerParts(rawParts);
         throwIfGenerationStopped(options);
 
@@ -2873,6 +2922,21 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
             throwIfGenerationStopped(options);
             if (p.mediaType === "voice_call") { triggerCall = "voice"; continue; }
             if (p.mediaType === "video_call") { triggerCall = "video"; continue; }
+            if (p.mediaType === "meeting_invite") {
+                // 仅允许私聊角色发起；把角色快照写进卡片，避免角色改名后旧邀请失去归属。
+                if (session.isGroup) continue;
+                pushFilteredPart({
+                    ...p,
+                    content: p.content || `${charN}发出了线下见面邀请`,
+                    mediaData: {
+                        ...p.mediaData,
+                        meetingInviteStatus: "pending",
+                        meetingInviteCharacterId: session.contactId,
+                        meetingInviteCharacterName: charN,
+                    },
+                });
+                continue;
+            }
             if (p.mediaType === "accept_red_packet" || p.mediaType === "decline_red_packet"
                 || p.mediaType === "accept_transfer" || p.mediaType === "decline_transfer"
                 || p.mediaType === "accept_payment_request" || p.mediaType === "decline_payment_request") {
@@ -3004,7 +3068,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
             dispatchChatMessageNotice({
                 sessionId: session.id,
                 senderName: charN,
-                avatar: character?.avatar || null,
+                avatar: effectiveCharacterAvatar || null,
                 body: body.slice(0, 80),
             });
         };
@@ -3016,7 +3080,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
             dispatchVisibleNotice(msg);
             const body = getNoticeBody(msg);
             if (body) {
-                sendBrowserNotification(charN, { body: body.slice(0, 60), icon: character?.avatar || undefined });
+                sendBrowserNotification(charN, { body: body.slice(0, 60), icon: effectiveCharacterAvatar || undefined });
             }
             const afterPublishResult = entry.afterPublish?.(msg);
             if (afterPublishResult) imageReplacementTasks.push(Promise.resolve(afterPublishResult));
@@ -3241,6 +3305,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
         history,
         errorPrefix = "发送失败",
         onDecline,
+        retryInstruction,
     }: ManagedGenerationOptions) => {
         if (isGeneratingRef.current) {
             if (activeGenerationRuns.has(session.id)) return;
@@ -3261,11 +3326,22 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
         setGenerationLock(session.id);
 
         try {
+            const trimmedRetryInstruction = retryInstruction?.trim();
+            const generationHistory: ChatMessage[] = trimmedRetryInstruction
+                ? [...history, {
+                    id: `_instruction_retry_${Date.now()}`,
+                    sessionId: session.id,
+                    role: "system",
+                    content: `【本次重新生成额外要求】\n${trimmedRetryInstruction}\n只在本次重新生成中遵守；不要复述、解释或向用户展示这段隐藏要求。`,
+                    status: "sent",
+                    createdAt: new Date().toISOString(),
+                }]
+                : history;
             if (session.isGroup) {
                 let roundReasoning: string | undefined;
                 const results = await generateGroupChatCompletion(
                     session,
-                    history,
+                    generationHistory,
                     {
                         onReasoning: (t) => { roundReasoning = t; },
                         onStreamDelta: (delta) => {
@@ -3308,7 +3384,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                 let capturedReasoning: string | undefined;
                 const cr = await generateChatCompletion(
                     session,
-                    history,
+                    generationHistory,
                     {
                         appTags: theaterMode ? ["chat"] : ["chat", "text"],
                         signal: generationRun.controller.signal,
@@ -3487,6 +3563,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
             ...(mediaUrl ? { mediaUrl } : {}),
         });
         setMessages(prev => [...prev, newMsg]);
+        onUserMessageSent?.(newMsg);
         setPendingGenerate(true);
         return true;
     };
@@ -4057,6 +4134,69 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
         return true;
     };
 
+    const handleMeetingInviteAction = async (invite: ChatMessage, action: "accept" | "decline") => {
+        if (invite.mediaData?.meetingInviteStatus && invite.mediaData.meetingInviteStatus !== "pending") return;
+        const resolvedAt = new Date().toISOString();
+        if (action === "decline") {
+            const nextMediaData: ChatMessage["mediaData"] = {
+                ...invite.mediaData,
+                meetingInviteStatus: "declined",
+                meetingInviteResolvedAt: resolvedAt,
+            };
+            updateMessageMediaData(invite.id, nextMediaData);
+            setMessages((current) => current.map((item) => item.id === invite.id ? { ...item, mediaData: nextMediaData } : item));
+            // 按普通用户消息落库并立即触发回复，让角色真实收到拒绝而不是只改卡片外观。
+            handleSendText("不同意", { autoReply: true });
+            return;
+        }
+
+        try {
+            await hydrateStoryStorage();
+            const characterId = invite.mediaData?.meetingInviteCharacterId || session.contactId;
+            const characterName = invite.mediaData?.meetingInviteCharacterName || character?.name || "角色";
+            const mainSession = loadStorySessionsForOwner("single", characterId)
+                .find((item) => (item.branchId || "main") === "main")
+                || createOrGetStorySession(characterId, { ownerType: "single", ownerId: characterId, branchId: "main" });
+            const now = new Date();
+            const branchName = `${now.getFullYear()}年${now.getMonth() + 1}月${now.getDate()}日 ${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+            const storySession = createOrGetStorySession(characterId, {
+                ownerType: "single",
+                ownerId: characterId,
+                participantIds: [characterId],
+                branchId: `invite_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+                branchName,
+                inheritRecentMemory: true,
+                independentStory: false,
+                baseSession: mainSession,
+            });
+            const acceptedReaction = invite.mediaData?.meetingInviteAcceptResponse?.trim();
+            const meetingDescription = invite.mediaData?.meetingInviteDescription?.trim();
+            const launchPrompt = `${characterName}在线上邀请${userIdentity?.name || "用户"}线下见面，用户已经同意。${meetingDescription ? `邀请说明：${meetingDescription}。` : ""}${acceptedReaction ? `${characterName}对此的反应是：${acceptedReaction}。` : ""}请由${characterName}根据刚才的私聊语境自然开启这次见面剧情。`;
+            updateStorySession(storySession.id, {
+                autoStartPrompt: launchPrompt,
+                autoStartRequestedAt: resolvedAt,
+            });
+            const nextStorySession = {
+                ...storySession,
+                autoStartPrompt: launchPrompt,
+                autoStartRequestedAt: resolvedAt,
+            };
+            saveStoryLaunchTarget(nextStorySession);
+
+            const nextMediaData: ChatMessage["mediaData"] = {
+                ...invite.mediaData,
+                meetingInviteStatus: "accepted",
+                meetingInviteResolvedAt: resolvedAt,
+                meetingInviteStorySessionId: storySession.id,
+            };
+            updateMessageMediaData(invite.id, nextMediaData);
+            setMessages((current) => current.map((item) => item.id === invite.id ? { ...item, mediaData: nextMediaData } : item));
+            window.dispatchEvent(new CustomEvent("open-app", { detail: { appId: "story" } }));
+        } catch (error) {
+            showChatToast(error instanceof Error ? error.message : "创建见面剧情失败，请稍后再试");
+        }
+    };
+
     // 线下 XML 构造与提示词查看器共用 lib/offline-prompt-builder（社区 #108），
     // 保证「预览 = 真实发出的提示词」；此处仅包一层稳定引用。
     // 自定义状态栏：custom 生效时新消息盖戳，折叠区改走用户渲染代码；旧消息按原生渲染
@@ -4144,7 +4284,89 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
         setEditingOfflineContent(role === "user" ? turn.userContent : formatOfflineTurnXml(turn));
     };
 
+    const openStoryEntry = async (migration: "summary" | "branch" | "none") => {
+        if (session.isGroup) {
+            window.dispatchEvent(new CustomEvent("open-app", { detail: { appId: "story" } }));
+            return;
+        }
+        try {
+            await hydrateStoryStorage();
+            const characterId = session.contactId;
+            const mainSession = loadStorySessionsForOwner("single", characterId)
+                .find((item) => (item.branchId || "main") === "main")
+                || createOrGetStorySession(characterId, { ownerType: "single", ownerId: characterId, branchId: "main" });
+            const turns = loadChatOfflineTurns(session.id);
+            let targetSession = mainSession;
+            if (migration === "summary") {
+                preserveChatOfflineSummaries(session.id);
+                clearChatOfflineTurns(session.id);
+            } else if (migration === "branch" && turns.length) {
+                const now = new Date();
+                const branchName = `旧线下记录 ${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+                targetSession = createOrGetStorySession(characterId, {
+                    ownerType: "single",
+                    ownerId: characterId,
+                    participantIds: [characterId],
+                    branchId: `offline_migration_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+                    branchName,
+                    inheritRecentMemory: true,
+                    independentStory: false,
+                    baseSession: mainSession,
+                });
+                const migratedMessages: StoryMessage[] = turns.flatMap((turn, index) => {
+                    const baseTime = new Date(turn.createdAt).getTime();
+                    const userCreatedAt = Number.isFinite(baseTime) ? new Date(baseTime).toISOString() : turn.createdAt;
+                    const assistantCreatedAt = Number.isFinite(baseTime) ? new Date(baseTime + 1).toISOString() : turn.createdAt;
+                    return [
+                        {
+                            id: `story_offline_user_${Date.now()}_${index}_${Math.random().toString(36).slice(2, 6)}`,
+                            sessionId: targetSession.id,
+                            role: "user" as const,
+                            rawContent: turn.userContent,
+                            createdAt: userCreatedAt,
+                        },
+                        {
+                            id: `story_offline_assistant_${Date.now()}_${index}_${Math.random().toString(36).slice(2, 6)}`,
+                            sessionId: targetSession.id,
+                            role: "assistant" as const,
+                            rawContent: turn.assistantContent,
+                            storySummary: turn.summary || undefined,
+                            createdAt: assistantCreatedAt,
+                        },
+                    ];
+                });
+                replaceStoryMessages(targetSession.id, migratedMessages);
+                const last = migratedMessages[migratedMessages.length - 1];
+                if (last) {
+                    updateStorySession(targetSession.id, {
+                        lastMessageId: last.id,
+                        lastMessagePreview: last.rawContent.replace(/\s+/g, " ").trim().slice(0, 64),
+                        lastMessageAt: last.createdAt,
+                        updatedAt: last.createdAt,
+                    });
+                }
+                clearChatOfflineTurns(session.id);
+            }
+            saveStoryLaunchTarget(targetSession);
+            setStoryEntryMigrationOpen(false);
+            setOfflineTurns([]);
+            window.dispatchEvent(new CustomEvent("open-app", { detail: { appId: "story" } }));
+        } catch (error) {
+            showChatToast(error instanceof Error ? error.message : "进入剧情失败，请稍后再试");
+        }
+    };
+
     const toggleOfflineMode = () => {
+        if (storyEntryEnabled && !offlineMode) {
+            if (isGenerating) {
+                showChatToast("请先等待对方回复");
+                return;
+            }
+            const turns = loadChatOfflineTurns(session.id);
+            if (turns.length) setStoryEntryMigrationOpen(true);
+            else void openStoryEntry("none");
+            return;
+        }
         if (!offlineMode && isGenerating) {
             showChatToast("请先等待对方回复");
             return;
@@ -4416,7 +4638,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
         }
     };
 
-    const handleRetry = async (msgId: string) => {
+    const handleRetry = async (msgId: string, retryInstruction?: string) => {
         const msgIndex = messages.findIndex(m => m.id === msgId);
         if (msgIndex === -1 || messages[msgIndex].role !== "assistant") return;
 
@@ -4434,6 +4656,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
             history: contextMessages,
             errorPrefix: "重试失败",
             onDecline: triggerReply,
+            retryInstruction,
         });
     };
 
@@ -4966,7 +5189,10 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                         <button onClick={() => handleRetractMessage(storedMessageId)} className="ctx-menu-btn">撤回消息</button>
                     )}
                     {m.role === "assistant" && (
-                        <button onClick={() => handleRetry(storedMessageId)} className="ctx-menu-btn ctx-menu-btn-danger">重试以下</button>
+                        <>
+                            <button onClick={() => handleRetry(storedMessageId)} className="ctx-menu-btn ctx-menu-btn-danger">重试以下</button>
+                            <button onClick={() => { setInstructionRetryTargetId(storedMessageId); setInstructionRetryDraft(""); setActiveMessageId(null); }} className="ctx-menu-btn">指令重试</button>
+                        </>
                     )}
                 </div>
                 <div className="flex">
@@ -5578,7 +5804,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                                 <div className="chat-offline-entry" data-role="assistant">
                                     {/* 头像占位：默认 display:none（见 chat.css），供自定义 CSS 显示 */}
                                     <div className="chat-offline-avatar" aria-hidden="true">
-                                        {character?.avatar ? <img src={character.avatar} alt="" /> : <ChatFallbackAvatar />}
+                                        {effectiveCharacterAvatar ? <img src={effectiveCharacterAvatar} alt="" /> : <ChatFallbackAvatar />}
                                     </div>
                                     <div className="chat-offline-label-row">
                                         <div className="chat-offline-label">{session.isGroup ? (session.groupName || "群聊") : (character?.name || "对方")}</div>
@@ -5679,7 +5905,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                                        正文用轻量 pre-wrap 渲染（避免每帧 markdown/双语解析），落库时原地换成正式排版 */
                                     <div className="chat-offline-entry" data-role="assistant">
                                         <div className="chat-offline-avatar" aria-hidden="true">
-                                            {character?.avatar ? <img src={character.avatar} alt="" /> : <ChatFallbackAvatar />}
+                                            {effectiveCharacterAvatar ? <img src={effectiveCharacterAvatar} alt="" /> : <ChatFallbackAvatar />}
                                         </div>
                                         <div className="chat-offline-label-row">
                                             <div className="chat-offline-label">{session.isGroup ? (session.groupName || "群聊") : (character?.name || "对方")}</div>
@@ -5835,6 +6061,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
 
                     const renderMsg = msg;
                     const isSystemInstruction = isSystemInstructionMessage(renderMsg);
+                    const isCompactSystemInstruction = isSystemInstruction && renderMsg.mediaData?.compactSystemInstruction === true;
                     const bubbleDisplayContent = getMessageDisplayContent(renderMsg);
                     let prevVisibleMsg: RenderChatMessage | null = null;
                     for (let prevIdx = idx - 1; prevIdx >= 0; prevIdx -= 1) {
@@ -5940,7 +6167,9 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                                             }
                                         }}
                                         onContextMenu={(e) => { e.preventDefault(); openMessageContextMenu(msg.id, { x: e.clientX, y: e.clientY }); }}
-                                        className={isSystemInstruction
+                                        className={isCompactSystemInstruction
+                                            ? "chat-sys-msg break-all max-w-[90%] relative cursor-pointer"
+                                            : isSystemInstruction
                                             ? "chat-system-instruction-card relative cursor-pointer"
                                             : `chat-sys-msg break-all max-w-[90%] relative cursor-pointer${blacklistEvent ? " chat-blacklist-event" : ""}${
                                                 // 骰子旁白：等骰子落定再淡入，避免剧透点数
@@ -5950,7 +6179,9 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                                             }`}
                                         {...(activeMessageId === msg.id ? { "data-active": "" } : {})}
                                     >
-                                        {isSystemInstruction ? (
+                                        {isCompactSystemInstruction ? (
+                                            <span>{getSystemInstructionDisplayContent(msg.content)}</span>
+                                        ) : isSystemInstruction ? (
                                             <SystemInstructionCard content={msg.content} />
                                         ) : msg.mediaType === "memory_write_request" ? (
                                             <MemoryWriteRequestCard
@@ -6046,6 +6277,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                                                         const senderChar = session.isGroup && msg.senderCharacterId
                                                             ? groupCharMap.get(msg.senderCharacterId) || character
                                                             : character;
+                                                        const senderAvatar = session.isGroup ? senderChar?.avatar : effectiveCharacterAvatar;
                                                         return (
                                                             <>
                                                     <div onDoubleClick={() => {
@@ -6054,8 +6286,8 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                                                             : character;
                                                         if (targetChar) sendRichMessage("poke", { pokeTarget: targetChar.name });
                                                     }} className="w-[40px] h-[40px] rounded-[20px] bg-[var(--c-input)] overflow-hidden cursor-pointer">
-                                                        {senderChar?.avatar ? (
-                                                            <img src={senderChar.avatar} className="w-full h-full object-cover" alt="" />
+                                                        {resolveChatCharacterAvatar(senderChar) ? (
+                                                            <img src={resolveChatCharacterAvatar(senderChar)} className="w-full h-full object-cover" alt="" />
                                                         ) : (
                                                             <ChatFallbackAvatar />
                                                         )}
@@ -6116,6 +6348,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                                                 }}
                                                 onMusicPlay={handleMusicCardPlay}
                                                 onActionSelect={(text) => chatTextInputRef.current?.appendText(text)}
+                                                onMeetingInviteAction={handleMeetingInviteAction}
                                                 defaultTranslationExpanded={session.collapseBilingualTranslation !== false ? false : true}
                                             />
                                         </div>
@@ -6237,7 +6470,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                                         <div key={`stream-${part.characterId}-${i}-${j}`} className="chat-msg-wrapper" data-role="assistant">
                                             <div className="chat-msg-avatar flex flex-col items-center gap-1 shrink-0">
                                                 <div className="w-[40px] h-[40px] rounded-[20px] bg-[var(--c-input)] overflow-hidden">
-                                                    {senderChar?.avatar ? <img src={senderChar.avatar} className="w-full h-full object-cover" alt="" /> : <ChatFallbackAvatar />}
+                                                    {resolveChatCharacterAvatar(senderChar) ? <img src={resolveChatCharacterAvatar(senderChar)} className="w-full h-full object-cover" alt="" /> : <ChatFallbackAvatar />}
                                                 </div>
                                             </div>
                                             <div className="chat-msg-content-wrap flex flex-col min-w-0 max-w-[70%]">
@@ -6259,7 +6492,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                                     <div key={`stream-seg-${j}`} className="chat-msg-wrapper" data-role="assistant">
                                         <div className="chat-msg-avatar flex flex-col items-center gap-1 shrink-0">
                                             <div className="w-[40px] h-[40px] rounded-[20px] bg-[var(--c-input)] overflow-hidden">
-                                                {character?.avatar ? <img src={character.avatar} className="w-full h-full object-cover" alt="" /> : <ChatFallbackAvatar />}
+                                                {effectiveCharacterAvatar ? <img src={effectiveCharacterAvatar} className="w-full h-full object-cover" alt="" /> : <ChatFallbackAvatar />}
                                             </div>
                                         </div>
                                         <div className="chat-msg-content-wrap flex flex-col min-w-0 max-w-[70%]">
@@ -6336,6 +6569,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
 	                isGenerating={isGenerating}
 	                theaterMode={theaterMode}
 	                enterToSendEnabled={enterToSendEnabled}
+	                storyEntryEnabled={storyEntryEnabled}
 	                quotingMessage={quotingMessage}
                 showEmojiPanel={showEmojiPanel}
                 showStickerPanel={showStickerPanel}
@@ -6574,6 +6808,53 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                     }}
                     onClose={() => setRichModal(null)}
                 />
+            )}
+
+            {instructionRetryTargetId && (
+                <div className="modal-overlay" data-ui="modal" role="dialog" aria-modal="true" aria-label="指令重试" onClick={() => setInstructionRetryTargetId(null)}>
+                    <div className="modal-dialog" onClick={event => event.stopPropagation()}>
+                        <span className="modal-header-title">指令重试</span>
+                        <p className="menu-desc">填写希望下一句怎样改变。内容只作为本次重新生成的隐藏提示词，不会出现在聊天记录里。</p>
+                        <textarea
+                            autoFocus
+                            className="ui-textarea min-h-[110px] w-full"
+                            value={instructionRetryDraft}
+                            onChange={event => setInstructionRetryDraft(event.target.value)}
+                            placeholder="例如：语气更克制，不要道歉；结合刚才的图片主动追问细节"
+                        />
+                        <div className="grid w-full grid-cols-2 gap-2">
+                            <button type="button" className="ui-btn ui-btn-ghost" onClick={() => setInstructionRetryTargetId(null)}>取消</button>
+                            <button
+                                type="button"
+                                className="ui-btn ui-btn-primary"
+                                disabled={!instructionRetryDraft.trim()}
+                                onClick={() => {
+                                    const targetId = instructionRetryTargetId;
+                                    const instruction = instructionRetryDraft.trim();
+                                    setInstructionRetryTargetId(null);
+                                    setInstructionRetryDraft("");
+                                    void handleRetry(targetId, instruction);
+                                }}
+                            >重新生成</button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {storyEntryMigrationOpen && (
+                <div className="modal-overlay" data-ui="modal" role="dialog" aria-modal="true" aria-label="迁移旧线下消息" onClick={() => setStoryEntryMigrationOpen(false)}>
+                    <div className="modal-dialog" onClick={event => event.stopPropagation()}>
+                        <span className="modal-header-title">检测到旧线下模式消息</span>
+                        <p className="menu-desc">进入剧情前请选择处理方式。处理成功后旧线下正文会从聊天页清空。</p>
+                        <button type="button" className="menu-item w-full text-left" onClick={() => void openStoryEntry("summary")}>
+                            <span className="menu-label-group"><span className="menu-label">只保留摘要在短期记忆</span><span className="menu-desc">清空旧线下正文，但保留已有摘要供角色记忆调用</span></span>
+                        </button>
+                        <button type="button" className="menu-item w-full text-left" onClick={() => void openStoryEntry("branch")}>
+                            <span className="menu-label-group"><span className="menu-label">传送到新的剧情分线</span><span className="menu-desc">完整迁移用户与角色消息；不推荐再合并进主线</span></span>
+                        </button>
+                        <button type="button" className="ui-btn ui-btn-ghost w-full" onClick={() => setStoryEntryMigrationOpen(false)}>取消</button>
+                    </div>
+                </div>
             )}
 
             {/* 思维链底部弹窗（Claude app 风格） */}
@@ -6832,7 +7113,9 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
             {/* 单聊语音/视频通话：内联挂载（而非提前 return），使缩小为悬浮窗时通话组件
                 不被卸载，计时/字幕等状态得以保留；组件内部依据 minimized 决定渲染
                 全屏界面还是左侧悬浮窗 */}
-            {showVoiceCall && character && (
+            {/* 通话层挂到聊天室的父容器，脱离 session 自定义 CSS 的作用域。
+                这样用户美化 header/footer、定位和 z-index 时不会遮挡通话顶栏/底栏。 */}
+            {wrapperRef.current?.parentElement && showVoiceCall && character && createPortal(
                 <VoiceCallScreen
                     session={session}
                     character={character}
@@ -6841,9 +7124,10 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                     onMinimize={() => setCallMinimized(true)}
                     onRestore={() => setCallMinimized(false)}
                     onEnd={() => returnFromCall(() => setShowVoiceCall(false))}
-                />
+                />,
+                wrapperRef.current.parentElement,
             )}
-            {showVideoCall && character && (
+            {wrapperRef.current?.parentElement && showVideoCall && character && createPortal(
                 <VideoCallScreen
                     session={session}
                     character={character}
@@ -6852,7 +7136,8 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                     onMinimize={() => setCallMinimized(true)}
                     onRestore={() => setCallMinimized(false)}
                     onEnd={() => returnFromCall(() => setShowVideoCall(false))}
-                />
+                />,
+                wrapperRef.current.parentElement,
             )}
 
         </div >

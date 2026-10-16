@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ChevronLeftIcon,
   ChevronRightIcon,
+  ArrowDownTrayIcon,
   PlusIcon,
   TrashIcon,
   XMarkIcon,
@@ -11,6 +12,7 @@ import {
 import { Avatar } from "@/components/ui/primitives";
 import type { Character } from "@/lib/character-types";
 import type { StoryGroup, StorySession } from "@/lib/story-storage";
+import { fileToUserAvatarDataUrl } from "@/lib/user-avatar-image";
 
 export type StoryBranchCreateInput = {
   name: string;
@@ -35,9 +37,16 @@ type StoryPaginationManagerProps = {
   onBranchCreate: (input: StoryBranchCreateInput) => void;
   onBranchDelete: (sessionIds: string[]) => void;
   onSessionUpdate: (sessionId: string, updates: Partial<StorySession>) => void;
+  onExportSession: (sessionId: string) => void;
+  onExportSessions: (sessionIds: string[]) => void;
+  onExportAll: () => void;
+  onMergeBranches: (sessionIds: string[]) => void;
 };
 
-function AvatarCollage({ characters, large = false }: { characters: Character[]; large?: boolean }) {
+function AvatarCollage({ characters, large = false, customAvatar }: { characters: Character[]; large?: boolean; customAvatar?: string }) {
+  if (customAvatar) {
+    return <span className={`story-custom-avatar${large ? " is-large" : ""}`}><img src={customAvatar} alt="剧情头像" /></span>;
+  }
   const visible = characters.slice(0, 4);
   if (visible.length <= 1) {
     const character = visible[0];
@@ -61,8 +70,11 @@ export function StoryPaginationManager(props: StoryPaginationManagerProps) {
   const [branchName, setBranchName] = useState("");
   const [inheritRecentMemory, setInheritRecentMemory] = useState(false);
   const [independentStory, setIndependentStory] = useState(false);
-  const [deleteSelection, setDeleteSelection] = useState<string[]>([]);
+  const [batchMenuOpen, setBatchMenuOpen] = useState(false);
+  const [batchAction, setBatchAction] = useState<"delete" | "export" | "merge" | null>(null);
+  const [batchSelection, setBatchSelection] = useState<string[]>([]);
   const [tagDraft, setTagDraft] = useState("");
+  const storyAvatarInputRef = useRef<HTMLInputElement>(null);
 
   const activeGroup = props.groups.find((group) => group.id === props.activeGroupId) || null;
   const activeOwnerCharacters = useMemo(() => {
@@ -78,8 +90,29 @@ export function StoryPaginationManager(props: StoryPaginationManagerProps) {
   const tags = mainSession?.catalogTags || [];
 
   useEffect(() => {
-    setDeleteSelection((current) => current.filter((id) => props.sessions.some((session) => session.id === id && (session.branchId || "main") !== "main")));
-  }, [props.sessions]);
+    setBatchSelection((current) => current.filter((id) => props.sessions.some((session) => session.id === id && (batchAction === "export" || (session.branchId || "main") !== "main"))));
+  }, [batchAction, props.sessions]);
+
+  const beginBatchAction = (action: "delete" | "export" | "merge") => {
+    setBatchAction(action);
+    setBatchSelection([]);
+    setBatchMenuOpen(false);
+  };
+
+  const finishBatchAction = () => {
+    if (!batchAction || !batchSelection.length) return;
+    if (batchAction === "delete") {
+      if (!window.confirm(`删除选中的 ${batchSelection.length} 条分线？消息也会一并删除。`)) return;
+      props.onBranchDelete(batchSelection);
+    } else if (batchAction === "export") {
+      props.onExportSessions(batchSelection);
+    } else {
+      if (!window.confirm(`把选中的 ${batchSelection.length} 条分线按剧情时间合并到主线？只有已继承记忆或已写入记忆的分线会生效。`)) return;
+      props.onMergeBranches(batchSelection);
+    }
+    setBatchSelection([]);
+    setBatchAction(null);
+  };
 
   const openGroupModal = () => {
     setSelectedCharacterIds([]);
@@ -116,6 +149,16 @@ export function StoryPaginationManager(props: StoryPaginationManagerProps) {
     if (!tag || !mainSession) return;
     props.onSessionUpdate(mainSession.id, { catalogTags: Array.from(new Set([...tags, tag])) });
     setTagDraft("");
+  };
+
+  const changeStoryAvatar = async (file?: File) => {
+    if (!file || !mainSession) return;
+    try {
+      const avatar = await fileToUserAvatarDataUrl(file);
+      props.onSessionUpdate(mainSession.id, { storyAvatar: avatar });
+    } catch {
+      window.alert("剧情头像处理失败，请换一张图片重试");
+    }
   };
 
   return (
@@ -172,6 +215,21 @@ export function StoryPaginationManager(props: StoryPaginationManagerProps) {
         ) : null}
       </section>
 
+      <section className="story-settings-card story-owner-avatar-card">
+        <div className="story-owner-avatar-preview">
+          <AvatarCollage characters={activeOwnerCharacters} customAvatar={mainSession?.storyAvatar} />
+        </div>
+        <button type="button" className="story-owner-avatar-pick" onClick={() => storyAvatarInputRef.current?.click()}>
+          <span><strong>为当前{activeGroup ? "多人组" : "角色"}设置单独头像</strong><small>从相册选取，只用于当前剧情对象</small></span>
+          <ChevronRightIcon width={17} />
+        </button>
+        {mainSession?.storyAvatar ? <button type="button" className="story-owner-avatar-reset" onClick={() => props.onSessionUpdate(mainSession.id, { storyAvatar: undefined })}>恢复默认</button> : null}
+        <input ref={storyAvatarInputRef} type="file" accept="image/*" className="hidden" onChange={(event) => {
+          void changeStoryAvatar(event.target.files?.[0]);
+          event.target.value = "";
+        }} />
+      </section>
+
       <section className="story-settings-card">
         <div className="story-settings-card-head">
           <div><h2>剧情分页设置</h2><p>主线固定为第一节；分线拥有各自独立的消息进度</p></div>
@@ -201,7 +259,7 @@ export function StoryPaginationManager(props: StoryPaginationManagerProps) {
           </header>
           <main className="story-catalog-scroll">
             <section className="story-book-hero">
-              <div className="story-book-cover"><AvatarCollage characters={activeOwnerCharacters} large /></div>
+              <div className="story-book-cover"><AvatarCollage characters={activeOwnerCharacters} large customAvatar={mainSession?.storyAvatar} /></div>
               <div className="story-book-meta">
                 <h1>{title}</h1>
                 <p>共 {props.sessions.length} 节</p>
@@ -223,34 +281,42 @@ export function StoryPaginationManager(props: StoryPaginationManagerProps) {
               <div className="story-directory-head">
                 <h2>目录</h2>
                 <div>
+                  <button type="button" onClick={props.onExportAll}><ArrowDownTrayIcon width={14} />导出全部</button>
                   <button type="button" onClick={() => setBranchModalOpen(true)}><PlusIcon width={14} />增加分线</button>
-                  <button
-                    type="button"
-                    disabled={!deleteSelection.length}
-                    onClick={() => {
-                      if (!deleteSelection.length) return;
-                      if (window.confirm(`删除选中的 ${deleteSelection.length} 条分线？消息也会一并删除。`)) {
-                        props.onBranchDelete(deleteSelection);
-                        setDeleteSelection([]);
-                      }
-                    }}
-                  ><TrashIcon width={14} />删除</button>
+                  <button type="button" onClick={() => setBatchMenuOpen((value) => !value)}>批量操作</button>
                 </div>
               </div>
+              {batchMenuOpen ? (
+                <div className="story-directory-batch-picker">
+                  <button type="button" onClick={() => beginBatchAction("delete")}><TrashIcon width={14} />批量删除</button>
+                  <button type="button" onClick={() => beginBatchAction("export")}><ArrowDownTrayIcon width={14} />批量导出</button>
+                  <button type="button" onClick={() => beginBatchAction("merge")}>分线合并</button>
+                </div>
+              ) : null}
+              {batchAction ? (
+                <div className="story-directory-batch-bar">
+                  <span>{batchAction === "delete" ? "选择要删除的分线" : batchAction === "export" ? "选择要导出的章节" : "选择要合并到主线的分线"}</span>
+                  <button type="button" onClick={() => { setBatchAction(null); setBatchSelection([]); }}>取消</button>
+                  <button type="button" disabled={!batchSelection.length} onClick={finishBatchAction}>完成（{batchSelection.length}）</button>
+                </div>
+              ) : null}
               <div className="story-directory-list">
                 {props.sessions.map((session, index) => {
                   const isMain = (session.branchId || "main") === "main";
-                  const isSelected = deleteSelection.includes(session.id);
+                  const isSelected = batchSelection.includes(session.id);
+                  const selectable = batchAction === "export" || !isMain;
                   return (
-                    <div key={session.id} className="story-directory-row" data-active={session.id === props.activeSessionId ? "true" : undefined}>
-                      <label className="story-directory-check">
-                        <input
-                          type="checkbox"
-                          disabled={isMain}
-                          checked={!isMain && isSelected}
-                          onChange={(event) => setDeleteSelection((current) => event.target.checked ? [...current, session.id] : current.filter((id) => id !== session.id))}
-                        />
-                      </label>
+                    <div key={session.id} className="story-directory-row" data-batch={batchAction ? "true" : "false"} data-active={session.id === props.activeSessionId ? "true" : undefined}>
+                      {batchAction ? (
+                        <label className="story-directory-check">
+                          <input
+                            type="checkbox"
+                            disabled={!selectable}
+                            checked={selectable && isSelected}
+                            onChange={(event) => setBatchSelection((current) => event.target.checked ? [...current, session.id] : current.filter((id) => id !== session.id))}
+                          />
+                        </label>
+                      ) : null}
                       <div className="story-directory-open" role="button" tabIndex={0} onClick={() => {
                         props.onSessionSelect(session.id);
                         setCatalogOpen(false);
@@ -276,18 +342,23 @@ export function StoryPaginationManager(props: StoryPaginationManagerProps) {
                             {isMain ? "默认主线 · 不可更名删除" : [
                               session.independentStory ? "独立剧情" : "角色记忆",
                               session.inheritRecentMemory ? "已继承最近记忆" : "从创建时开始",
-                            ].join(" · ")}
+                            session.mergedIntoMainAt ? "已合并主线" : "",
+                            ].filter(Boolean).join(" · ")}
                           </small>
+                          <small className="story-directory-date">最近聊天：{session.lastMessageAt || session.lastMessageId ? new Date(session.lastMessageAt || session.updatedAt).toLocaleString() : "还没有聊天"}</small>
                         </span>
                       </div>
-                      {!isMain && session.independentStory && !session.includedInMemoryAt ? (
-                        <button type="button" className="story-branch-memory" onClick={() => {
-                          if (window.confirm("结束这条独立剧情并把剧情摘要加入角色记忆？")) {
-                            const now = new Date().toISOString();
-                            props.onSessionUpdate(session.id, { endedAt: now, includedInMemoryAt: now });
-                          }
-                        }}>结束并加入记忆</button>
-                      ) : null}
+                      <div className="story-directory-actions">
+                        {!isMain && session.independentStory && !session.includedInMemoryAt ? (
+                          <button type="button" className="story-branch-memory" onClick={() => {
+                            if (window.confirm("结束这条独立剧情并把剧情摘要加入角色记忆？")) {
+                              const now = new Date().toISOString();
+                              props.onSessionUpdate(session.id, { endedAt: now, includedInMemoryAt: now });
+                            }
+                          }}>结束并加入记忆</button>
+                        ) : null}
+                        <button type="button" className="story-branch-export" aria-label={`导出${session.branchName || "剧情"}`} onClick={() => props.onExportSession(session.id)}><ArrowDownTrayIcon width={14} /></button>
+                      </div>
                     </div>
                   );
                 })}

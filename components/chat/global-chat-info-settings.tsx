@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { BellRing, ChevronRight, Code, Image as ImageIcon, LayoutPanelTop, RotateCcw, User, X } from "lucide-react";
+import { BellRing, ChevronRight, Code, Image as ImageIcon, LayoutPanelTop, Play, RotateCcw, User, X } from "lucide-react";
 import { PageShell } from "@/components/ui/page-shell";
 import CSSSchemeBar from "@/components/ui/css-scheme-picker";
 import { Toggle } from "@/components/ui/form";
@@ -13,9 +13,14 @@ import {
     normalizeVisionImagePromptLimit,
     saveChatAppSettings,
     saveChatSessions,
+    DEFAULT_MEETING_INVITE_CONTRACT,
+    DEFAULT_MEETING_INVITE_PREVIEW,
+    DEFAULT_MEETING_INVITE_RENDER,
+    resolveMeetingInviteCardConfig,
     type ChatSoundConfig,
     type ChatSoundKind,
     type ChatSoundsConfig,
+    type MeetingInviteCardConfig,
 } from "@/lib/chat-storage";
 import { getChatImageFromIndexedDB, saveChatImageToIndexedDB } from "@/lib/chat-asset-storage";
 import { dispatchChatMessageNotice } from "@/lib/chat-notification-events";
@@ -31,6 +36,8 @@ import {
 } from "@/lib/chat-status-region";
 import { CHAT_SESSION_CSS_EXAMPLE } from "@/lib/css-examples";
 import { fileToUserAvatarDataUrl } from "@/lib/user-avatar-image";
+import { CustomStatusFrame } from "./custom-status-frame";
+import { clearChatOfflineTurns, loadChatOfflineTurns } from "@/lib/chat-offline-storage";
 
 function saveSettings(patch: Record<string, unknown>) {
     saveChatAppSettings({ ...loadChatAppSettings(), ...patch });
@@ -126,10 +133,15 @@ export function GlobalChatInfoSettings({ onBack }: { onBack: () => void }) {
     const [customCSS, setCustomCSS] = useState(initial.globalChatCustomCSS || "");
     const [visionLimit, setVisionLimit] = useState(() => normalizeVisionImagePromptLimit(initial.globalVisionImagePromptLimit));
     const [status, setStatus] = useState<StatusRegionConfig>(() => getStatusRegionConfig(GLOBAL_CHAT_STATUS_REGION_ID, false));
+    const [meetingInvite, setMeetingInvite] = useState<MeetingInviteCardConfig>(() => resolveMeetingInviteCardConfig(initial));
+    const [storyAsOfflineMode, setStoryAsOfflineMode] = useState(initial.storyAsOfflineMode === true);
     const [editingCSS, setEditingCSS] = useState(false);
     const [editingStatus, setEditingStatus] = useState(false);
+    const [editingMeetingInvite, setEditingMeetingInvite] = useState(false);
     const [draftCSS, setDraftCSS] = useState(customCSS);
     const [draftStatus, setDraftStatus] = useState(status);
+    const [draftMeetingInvite, setDraftMeetingInvite] = useState(meetingInvite);
+    const [meetingPreviewHtml, setMeetingPreviewHtml] = useState(meetingInvite.renderHtml);
     const avatarInputRef = useRef<HTMLInputElement>(null);
     const backgroundInputRef = useRef<HTMLInputElement>(null);
 
@@ -170,6 +182,21 @@ export function GlobalChatInfoSettings({ onBack }: { onBack: () => void }) {
         saveSettings({ globalVisionImagePromptLimit: next });
     };
 
+    const changeStoryAsOfflineMode = (value: boolean) => {
+        if (!value) {
+            const sessionsWithOffline = loadChatSessions().filter(session => loadChatOfflineTurns(session.id).length > 0);
+            if (sessionsWithOffline.length) {
+                const keep = window.confirm(`检测到 ${sessionsWithOffline.length} 个会话仍有旧线下消息。\n\n确定：保留旧消息并恢复旧线下模式\n取消：继续选择是否清空旧消息`);
+                if (!keep) {
+                    const clear = window.confirm("要清空这些旧线下消息吗？摘要也会随旧记录一起删除。此操作不可恢复。\n\n确定：清空\n取消：保留");
+                    if (clear) sessionsWithOffline.forEach(session => clearChatOfflineTurns(session.id));
+                }
+            }
+        }
+        setStoryAsOfflineMode(value);
+        saveSettings({ storyAsOfflineMode: value });
+    };
+
     // 全部角色恢复默认：清空每个会话的单独聊天室 CSS，全部回落到全局聊天室 CSS / 主页外观 CSS。
     // 逐个派发 chat-session-css-updated，让正打开的聊天室（含桌面小窗）立即生效。
     const resetAllSessionCSS = () => {
@@ -205,6 +232,28 @@ export function GlobalChatInfoSettings({ onBack }: { onBack: () => void }) {
         } catch { alert("导入失败：不是有效的状态栏方案"); }
     };
 
+    const meetingInvitePayload = JSON.stringify({
+        type: "ai-phone-meeting-invite-card",
+        version: 1,
+        contract: draftMeetingInvite.contract,
+        renderHtml: draftMeetingInvite.renderHtml,
+        previewRaw: draftMeetingInvite.previewRaw,
+    }, null, 2);
+
+    const loadMeetingInvitePayload = (payload: string) => {
+        try {
+            const parsed = JSON.parse(payload) as Record<string, unknown>;
+            const next: MeetingInviteCardConfig = {
+                mode: "custom",
+                contract: typeof parsed.contract === "string" ? parsed.contract : DEFAULT_MEETING_INVITE_CONTRACT,
+                renderHtml: typeof parsed.renderHtml === "string" ? parsed.renderHtml : DEFAULT_MEETING_INVITE_RENDER,
+                previewRaw: typeof parsed.previewRaw === "string" ? parsed.previewRaw : DEFAULT_MEETING_INVITE_PREVIEW,
+            };
+            setDraftMeetingInvite(next);
+            setMeetingPreviewHtml(next.renderHtml);
+        } catch { alert("导入失败：不是有效的邀请见面卡片方案"); }
+    };
+
     if (editingCSS) {
         return (
             <PageShell title="全局聊天室 CSS" onBack={() => setEditingCSS(false)} className="absolute inset-0 z-[110]">
@@ -216,6 +265,50 @@ export function GlobalChatInfoSettings({ onBack }: { onBack: () => void }) {
                         <button className="ui-btn ui-btn-outline flex-1" onClick={() => setDraftCSS(CHAT_SESSION_CSS_EXAMPLE)}>示例</button>
                         <button className="ui-btn ui-btn-outline flex-1" onClick={() => setDraftCSS("")}>清除</button>
                         <button className="ui-btn ui-btn-soft-action flex-1" onClick={() => { setCustomCSS(draftCSS); saveSettings({ globalChatCustomCSS: draftCSS }); setEditingCSS(false); }}>应用</button>
+                    </div>
+                </div>
+            </PageShell>
+        );
+    }
+
+    if (editingMeetingInvite) {
+        return (
+            <PageShell title="邀请见面卡片 CSS 样式" onBack={() => setEditingMeetingInvite(false)} className="absolute inset-0 z-[110]">
+                <div className="theme-section-page flex flex-col gap-3">
+                    <div className="menu-group">
+                        <div className="menu-item">
+                            <div className="menu-label-group"><span className="menu-label">启用自定义卡片</span><span className="menu-desc">关闭时使用 Float 默认邀请卡片</span></div>
+                            <Toggle checked={draftMeetingInvite.mode === "custom"} onChange={checked => setDraftMeetingInvite(current => ({ ...current, mode: checked ? "custom" : "native" }))} />
+                        </div>
+                    </div>
+                    {draftMeetingInvite.mode === "custom" ? <>
+                        <label className="ts-13 font-medium text-[var(--c-text-title)]">输出契约</label>
+                        <textarea className="ui-textarea font-mono ts-12" style={{ minHeight: 130, resize: "vertical" }} value={draftMeetingInvite.contract} onChange={event => setDraftMeetingInvite(current => ({ ...current, contract: event.target.value }))} placeholder="告诉 AI 何时发起邀请，并列出卡片要填写的 key=value 字段" />
+                        <label className="ts-13 font-medium text-[var(--c-text-title)]">输出渲染</label>
+                        <textarea className="ui-textarea font-mono ts-12" style={{ minHeight: 210, resize: "vertical" }} value={draftMeetingInvite.renderHtml} onChange={event => setDraftMeetingInvite(current => ({ ...current, renderHtml: event.target.value }))} placeholder="完整 HTML / CSS / JS；按钮使用 data-meeting-action=accept 或 decline" />
+                        <div className="flex items-center justify-between gap-2">
+                            <label className="ts-13 font-medium text-[var(--c-text-title)]">预览</label>
+                            <button type="button" className="ui-btn ui-btn-ghost h-8 w-8 p-0" onClick={() => setMeetingPreviewHtml(draftMeetingInvite.renderHtml)} aria-label="运行预览" title="运行预览"><Play size={15} /></button>
+                        </div>
+                        <textarea className="ui-textarea font-mono ts-12" style={{ minHeight: 100, resize: "vertical" }} value={draftMeetingInvite.previewRaw} onChange={event => setDraftMeetingInvite(current => ({ ...current, previewRaw: event.target.value }))} placeholder="可编辑的示例数据" />
+                        {meetingPreviewHtml.trim() ? (
+                            <div className="rounded-2xl border border-[var(--c-card-border)] p-3" style={{ maxHeight: "55vh", overflowY: "auto", WebkitOverflowScrolling: "touch" }}>
+                                <CustomStatusFrame html={meetingPreviewHtml} raw={draftMeetingInvite.previewRaw} kind="meeting" title="邀请见面卡片预览" />
+                            </div>
+                        ) : null}
+                    </> : null}
+                    <div className="flex gap-2 items-center">
+                        <CSSSchemeBar target="meeting_invite_card" currentCSS={meetingInvitePayload} onLoad={loadMeetingInvitePayload} />
+                        <button className="ui-btn ui-btn-outline flex-1" onClick={() => {
+                            const next = { mode: "native", contract: DEFAULT_MEETING_INVITE_CONTRACT, renderHtml: DEFAULT_MEETING_INVITE_RENDER, previewRaw: DEFAULT_MEETING_INVITE_PREVIEW } as MeetingInviteCardConfig;
+                            setDraftMeetingInvite(next);
+                            setMeetingPreviewHtml(next.renderHtml);
+                        }}>恢复默认</button>
+                        <button className="ui-btn ui-btn-soft-action flex-1" onClick={() => {
+                            setMeetingInvite(draftMeetingInvite);
+                            saveSettings({ meetingInviteCard: draftMeetingInvite });
+                            setEditingMeetingInvite(false);
+                        }}>应用</button>
                     </div>
                 </div>
             </PageShell>
@@ -253,6 +346,11 @@ export function GlobalChatInfoSettings({ onBack }: { onBack: () => void }) {
             <div className="page-menu chat-info-menu">
                 <div className="px-4 pb-2 ts-12 text-[var(--c-text)] opacity-65">单独会话设置优先于这里；这里只改变聊天室，不会修改主页用户资料。状态栏仍仅用于私聊。</div>
                 <div className="menu-group">
+                    <div className="menu-item">
+                        <Play size={20} className="text-[var(--c-icon)]" />
+                        <div className="menu-label-group"><span className="menu-label">剧情入口</span><span className="menu-desc">用剧情作为线下模式；旧线下记录进入时可选择迁移方式</span></div>
+                        <Toggle checked={storyAsOfflineMode} onChange={changeStoryAsOfflineMode} />
+                    </div>
                     <div className="menu-item cursor-pointer" role="button" tabIndex={0} onClick={() => avatarInputRef.current?.click()} onKeyDown={event => { if (event.key === "Enter" || event.key === " ") avatarInputRef.current?.click(); }}>
                         <User size={20} className="text-[var(--c-icon)]" />
                         <div className="menu-label-group"><span className="menu-label">用户头像</span><span className="menu-desc">所有私聊和群聊默认使用</span></div>
@@ -267,6 +365,15 @@ export function GlobalChatInfoSettings({ onBack }: { onBack: () => void }) {
                         <LayoutPanelTop size={20} className="text-[var(--c-icon)]" />
                         <div className="menu-label-group"><span className="menu-label">私聊状态栏</span><span className="menu-desc">可从状态栏资源方案导入</span></div>
                         <div className="menu-right"><span className="menu-desc mr-1">{isCustomStatusRegionActive(status) ? "自定义" : "原生"}</span><ChevronRight size={16} /></div>
+                    </button>
+                    <button className="menu-item" onClick={() => {
+                        setDraftMeetingInvite(meetingInvite);
+                        setMeetingPreviewHtml(meetingInvite.renderHtml);
+                        setEditingMeetingInvite(true);
+                    }}>
+                        <LayoutPanelTop size={20} className="text-[var(--c-icon)]" />
+                        <div className="menu-label-group"><span className="menu-label">邀请见面卡片 CSS 样式</span><span className="menu-desc">自定义输出契约、输出渲染与预览</span></div>
+                        <div className="menu-right"><span className="menu-desc mr-1">{meetingInvite.mode === "custom" ? "自定义" : "默认"}</span><ChevronRight size={16} /></div>
                     </button>
                     <div className="menu-item cursor-pointer" role="button" tabIndex={0} onClick={() => backgroundInputRef.current?.click()} onKeyDown={event => { if (event.key === "Enter" || event.key === " ") backgroundInputRef.current?.click(); }}>
                         <ImageIcon size={20} className="text-[var(--c-icon)]" />
